@@ -1,0 +1,19 @@
+# Build output
+build/
+esp/
+
+# Object and binary files
+*.o
+*.obj
+*.so
+*.EFI
+
+# Backup files
+*.bak
+
+# Editor temporary files
+*~
+*.swp
+
+# test files
+test-uefi/
