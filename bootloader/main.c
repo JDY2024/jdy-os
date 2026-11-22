@@ -26,7 +26,7 @@ static void read_phdr(EFI_BOOT_SERVICES *bs, const UINT8 *buffer,
 }
 
 static EFI_STATUS load_segments(EFI_SYSTEM_TABLE *st, const UINT8 *buffer,
-                                UINTN file_size)
+                                UINTN file_size, UINT64 *entry)
 {
     EFI_BOOT_SERVICES *bs = st->BootServices;
     ELF64_HEADER eh;
@@ -164,6 +164,7 @@ static EFI_STATUS load_segments(EFI_SYSTEM_TABLE *st, const UINT8 *buffer,
     }
     st->ConOut->OutputString(st->ConOut,
                             L"Kernel segments loaded successfully\r\n");
+    *entry = eh.entry;
     status = EFI_SUCCESS;
 
 cleanup:
@@ -191,7 +192,8 @@ cleanup:
     return status;
 }
 
-static EFI_STATUS load_kernel(EFI_HANDLE image, EFI_SYSTEM_TABLE *st)
+static EFI_STATUS load_kernel(EFI_HANDLE image, EFI_SYSTEM_TABLE *st,
+                              UINT64 *entry)
 {
     EFI_GUID loaded_image_guid = EFI_LOADED_IMAGE_PROTOCOL_GUID;
     EFI_GUID filesystem_guid = EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID;
@@ -265,7 +267,7 @@ static EFI_STATUS load_kernel(EFI_HANDLE image, EFI_SYSTEM_TABLE *st)
     }
 
     stage = L"Load kernel segments (see diagnostic above)";
-    status = load_segments(st, buffer, file_size);
+    status = load_segments(st, buffer, file_size, entry);
 
 cleanup:
     if (EFI_ERROR(status)) {
@@ -280,6 +282,63 @@ cleanup:
     return status;
 }
 
+typedef VOID (__attribute__((sysv_abi)) *KERNEL_ENTRY)(VOID);
+
+static _Noreturn void halt_cpu(void)
+{
+    for (;;) __asm__ volatile("cli; hlt");
+}
+
+static EFI_STATUS boot_kernel(EFI_HANDLE image, EFI_SYSTEM_TABLE *st,
+                              UINT64 entry)
+{
+    EFI_BOOT_SERVICES *bs = st->BootServices;
+    EFI_MEMORY_DESCRIPTOR *map = NULL;
+    UINTN capacity = 0;
+    BOOLEAN exit_attempted = FALSE;
+    EFI_STATUS status;
+
+    for (;;) {
+        UINTN size = capacity;
+        UINTN key, descriptor_size;
+        UINT32 descriptor_version;
+        status = bs->GetMemoryMap(&size, map, &key, &descriptor_size,
+                                  &descriptor_version);
+        if (status == EFI_BUFFER_TOO_SMALL) {
+            /* Allocating the buffer can itself add map descriptors. */
+            if (size > ~(UINTN)0 - EFI_PAGE_SIZE) {
+                status = EFI_OUT_OF_RESOURCES;
+                break;
+            }
+            if (map != NULL) {
+                status = bs->FreePool(map);
+                if (EFI_ERROR(status)) break;
+                map = NULL;
+            }
+            capacity = size + EFI_PAGE_SIZE;
+            status = bs->AllocatePool(EfiLoaderData, capacity, (VOID **)&map);
+            if (EFI_ERROR(status)) break;
+            continue;
+        }
+        if (EFI_ERROR(status)) break;
+
+        exit_attempted = TRUE;
+        status = bs->ExitBootServices(image, key);
+        if (status == EFI_SUCCESS) {
+            /* Keep the current stack and enter the ELF function with SysV ABI. */
+            __asm__ volatile("cli; cld" ::: "memory", "cc");
+            ((KERNEL_ENTRY)(UINTN)entry)();
+            halt_cpu();
+        }
+        if (status != EFI_INVALID_PARAMETER) break;
+        /* Only Memory Allocation Services are safe after the first attempt. */
+    }
+
+    if (exit_attempted) halt_cpu();
+    if (map != NULL) bs->FreePool(map);
+    return status;
+}
+
 EFI_STATUS EFIAPI efi_main(
     EFI_HANDLE ImageHandle,
     EFI_SYSTEM_TABLE *SystemTable
@@ -291,9 +350,19 @@ EFI_STATUS EFIAPI efi_main(
         L"Hello World from My OS!\r\n"
     );
 
-    EFI_STATUS status = load_kernel(ImageHandle, SystemTable);
+    UINT64 entry;
+    EFI_STATUS status = load_kernel(ImageHandle, SystemTable, &entry);
+    if (EFI_ERROR(status)) {
+        SystemTable->BootServices->Stall(5000000);
+        return status;
+    }
 
-    SystemTable->BootServices->Stall(5000000);
-
+    con->OutputString(con, L"Exiting boot services, kernel entry=");
+    print_hex(SystemTable, entry);
+    con->OutputString(con, L"\r\n");
+    status = boot_kernel(ImageHandle, SystemTable, entry);
+    con->OutputString(con, L"Memory map preparation failed status=");
+    print_hex(SystemTable, status);
+    con->OutputString(con, L"\r\n");
     return status;
 }
