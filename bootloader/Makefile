@@ -31,7 +31,7 @@ LDFLAGS := \
 all: $(TARGET)
 
 # 1. C -> COFF object
-$(OBJECT): main.c
+$(OBJECT): main.c elf.h
 	mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 

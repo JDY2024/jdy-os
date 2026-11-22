@@ -1,4 +1,195 @@
 #include <efi.h>
+#include "elf.h"
+
+typedef struct {
+    UINT64 start, end; /* Page-aligned, exclusive end. */
+} LOAD_RANGE;
+
+static void print_hex(EFI_SYSTEM_TABLE *st, UINT64 value)
+{
+    CHAR16 text[19];
+    text[0] = L'0';
+    text[1] = L'x';
+    for (UINTN i = 0; i < 16; ++i)
+        text[2 + i] = L"0123456789ABCDEF"[(value >> (60 - 4 * i)) & 15];
+    text[18] = 0;
+    st->ConOut->OutputString(st->ConOut, text);
+}
+
+static void read_phdr(EFI_BOOT_SERVICES *bs, const UINT8 *buffer,
+                      const ELF64_HEADER *eh, UINTN index,
+                      ELF64_PROGRAM_HEADER *ph)
+{
+    /* Copy avoids unaligned structure accesses in an untrusted file. */
+    bs->CopyMem(ph, (VOID *)(buffer + eh->phoff + index * eh->phentsize),
+                sizeof(*ph));
+}
+
+static EFI_STATUS load_segments(EFI_SYSTEM_TABLE *st, const UINT8 *buffer,
+                                UINTN file_size)
+{
+    EFI_BOOT_SERVICES *bs = st->BootServices;
+    ELF64_HEADER eh;
+    ELF64_PROGRAM_HEADER ph, previous;
+    LOAD_RANGE *ranges = NULL;
+    UINTN count = 0, allocated = 0, segment = ~(UINTN)0;
+    BOOLEAN entry_valid = FALSE;
+    EFI_STATUS status = EFI_LOAD_ERROR;
+    CHAR16 *stage = L"Validate ELF header size";
+    const UINT64 max_address = 0x00007FFFFFFFFFFFULL;
+
+    if (file_size < sizeof(eh)) goto cleanup;
+    bs->CopyMem(&eh, (VOID *)buffer, sizeof(eh));
+    stage = L"Validate ELF identity/type/machine/version";
+    if (eh.ident[0] != 0x7f || eh.ident[1] != 'E' ||
+        eh.ident[2] != 'L' || eh.ident[3] != 'F' ||
+        eh.ident[4] != 2 || eh.ident[5] != 1 || eh.ident[6] != 1 ||
+        eh.type != 2 || eh.machine != 62 || eh.version != 1 ||
+        eh.ehsize != sizeof(eh)) goto cleanup;
+
+    stage = L"Validate program header table";
+    if (eh.phentsize != sizeof(ph) || eh.phnum == 0 || eh.phnum == 0xffff ||
+        eh.phoff < sizeof(eh) || eh.phoff > file_size ||
+        eh.phnum > (file_size - eh.phoff) / sizeof(ph)) goto cleanup;
+
+    stage = L"AllocatePool(load ranges)";
+    status = bs->AllocatePool(EfiLoaderData, eh.phnum * sizeof(*ranges),
+                              (VOID **)&ranges);
+    if (EFI_ERROR(status)) goto cleanup;
+    status = EFI_LOAD_ERROR;
+
+    /* Validate every segment before reserving or writing destination memory. */
+    for (UINTN i = 0; i < eh.phnum; ++i) {
+        segment = i;
+        read_phdr(bs, buffer, &eh, i, &ph);
+        stage = L"Unsupported dynamic/interpreter segment";
+        if (ph.type == ELF_PT_DYNAMIC || ph.type == ELF_PT_INTERP) goto cleanup;
+        if (ph.type != ELF_PT_LOAD) continue;
+        stage = L"Validate PT_LOAD file range/size";
+        if (ph.filesz > ph.memsz || ph.offset > file_size ||
+            ph.filesz > file_size - ph.offset) goto cleanup;
+        stage = L"Validate PT_LOAD fixed address/range";
+        /* Support lower-half identity addresses only; no relocation/mapping. */
+        if (ph.paddr != ph.vaddr || ph.paddr > max_address ||
+            ph.memsz > max_address - ph.paddr) goto cleanup;
+        stage = L"Validate PT_LOAD alignment";
+        if (ph.align > 1 && ((ph.align & (ph.align - 1)) != 0 ||
+            (ph.vaddr & (ph.align - 1)) != (ph.offset & (ph.align - 1))))
+            goto cleanup;
+        if (ph.memsz == 0) continue;
+        stage = L"Validate PT_LOAD nonzero page/address rounding";
+        if (ph.paddr < EFI_PAGE_SIZE ||
+            ph.paddr + ph.memsz > max_address - (EFI_PAGE_SIZE - 1))
+            goto cleanup;
+        stage = L"Validate PT_LOAD byte overlap";
+        for (UINTN j = 0; j < i; ++j) {
+            read_phdr(bs, buffer, &eh, j, &previous);
+            if (previous.type == ELF_PT_LOAD && previous.memsz != 0 &&
+                ph.paddr < previous.paddr + previous.memsz &&
+                previous.paddr < ph.paddr + ph.memsz) goto cleanup;
+        }
+        if ((ph.flags & ELF_PF_X) && eh.entry >= ph.vaddr &&
+            eh.entry - ph.vaddr < ph.memsz) entry_valid = TRUE;
+
+        LOAD_RANGE range = {
+            ph.paddr & ~((UINT64)EFI_PAGE_SIZE - 1),
+            (ph.paddr + ph.memsz + EFI_PAGE_SIZE - 1) &
+                ~((UINT64)EFI_PAGE_SIZE - 1)
+        };
+        UINTN pos = count;
+        while (pos > 0 && ranges[pos - 1].start > range.start) {
+            ranges[pos] = ranges[pos - 1];
+            --pos;
+        }
+        ranges[pos] = range;
+        ++count;
+    }
+    segment = ~(UINTN)0;
+    stage = L"Validate entry in executable PT_LOAD";
+    if (!entry_valid) goto cleanup;
+
+    /* Merge page overlaps, including distinct segments sharing one page. */
+    UINTN merged = 0;
+    for (UINTN i = 0; i < count; ++i) {
+        if (merged && ranges[i].start <= ranges[merged - 1].end) {
+            if (ranges[i].end > ranges[merged - 1].end)
+                ranges[merged - 1].end = ranges[i].end;
+        } else {
+            ranges[merged++] = ranges[i];
+        }
+    }
+    count = merged;
+    for (UINTN i = 0; i < count; ++i) {
+        EFI_PHYSICAL_ADDRESS address = ranges[i].start;
+        UINTN pages = (UINTN)((ranges[i].end - ranges[i].start) / EFI_PAGE_SIZE);
+        st->ConOut->OutputString(st->ConOut, L"AllocatePages requested=");
+        print_hex(st, address);
+        st->ConOut->OutputString(st->ConOut, L" pages=");
+        print_hex(st, pages);
+        st->ConOut->OutputString(st->ConOut, L"\r\n");
+        stage = L"AllocatePages(AllocateAddress, EfiLoaderCode)";
+        status = bs->AllocatePages(AllocateAddress, EfiLoaderCode, pages, &address);
+        if (EFI_ERROR(status)) goto cleanup;
+        ++allocated;
+        stage = L"Verify allocated address";
+        if (address != ranges[i].start) {
+            bs->FreePages(address, pages);
+            --allocated;
+            status = EFI_LOAD_ERROR;
+            goto cleanup;
+        }
+        st->ConOut->OutputString(st->ConOut, L"Allocated address=");
+        print_hex(st, address);
+        st->ConOut->OutputString(st->ConOut, L"\r\n");
+    }
+
+    for (UINTN i = 0; i < eh.phnum; ++i) {
+        read_phdr(bs, buffer, &eh, i, &ph);
+        if (ph.type != ELF_PT_LOAD || ph.memsz == 0) continue;
+        if (ph.filesz)
+            bs->CopyMem((VOID *)(UINTN)ph.paddr,
+                        (VOID *)(buffer + ph.offset), (UINTN)ph.filesz);
+        if (ph.memsz > ph.filesz)
+            bs->SetMem((VOID *)(UINTN)(ph.paddr + ph.filesz),
+                       (UINTN)(ph.memsz - ph.filesz), 0);
+        st->ConOut->OutputString(st->ConOut, L"PT_LOAD index=");
+        print_hex(st, i);
+        st->ConOut->OutputString(st->ConOut, L" destination=");
+        print_hex(st, ph.paddr);
+        st->ConOut->OutputString(st->ConOut, L" filesz=");
+        print_hex(st, ph.filesz);
+        st->ConOut->OutputString(st->ConOut, L" memsz=");
+        print_hex(st, ph.memsz);
+        st->ConOut->OutputString(st->ConOut, L"\r\n");
+    }
+    st->ConOut->OutputString(st->ConOut,
+                            L"Kernel segments loaded successfully\r\n");
+    status = EFI_SUCCESS;
+
+cleanup:
+    if (EFI_ERROR(status)) {
+        st->ConOut->OutputString(st->ConOut, stage);
+        if (segment != ~(UINTN)0) {
+            st->ConOut->OutputString(st->ConOut, L" segment=");
+            print_hex(st, segment);
+        }
+        st->ConOut->OutputString(st->ConOut, L" failed status=");
+        print_hex(st, status);
+        st->ConOut->OutputString(st->ConOut, L"\r\n");
+        while (allocated) {
+            --allocated;
+            EFI_STATUS release = bs->FreePages(ranges[allocated].start,
+                (UINTN)((ranges[allocated].end - ranges[allocated].start) / EFI_PAGE_SIZE));
+            if (EFI_ERROR(release)) {
+                st->ConOut->OutputString(st->ConOut, L"FreePages rollback failed status=");
+                print_hex(st, release);
+                st->ConOut->OutputString(st->ConOut, L"\r\n");
+            }
+        }
+    }
+    if (ranges) bs->FreePool(ranges);
+    return status;
+}
 
 static EFI_STATUS load_kernel(EFI_HANDLE image, EFI_SYSTEM_TABLE *st)
 {
@@ -73,22 +264,15 @@ static EFI_STATUS load_kernel(EFI_HANDLE image, EFI_SYSTEM_TABLE *st)
         goto cleanup;
     }
 
-    stage = L"Validate ELF magic";
-    if (buffer[0] != 0x7f || buffer[1] != 0x45 ||
-        buffer[2] != 0x4c || buffer[3] != 0x46) {
-        status = EFI_LOAD_ERROR;
-        goto cleanup;
-    }
-
-    st->ConOut->OutputString(st->ConOut, L"Kernel ELF loaded successfully\r\n");
-    status = EFI_SUCCESS;
+    stage = L"Load kernel segments (see diagnostic above)";
+    status = load_segments(st, buffer, file_size);
 
 cleanup:
     if (EFI_ERROR(status)) {
         st->ConOut->OutputString(st->ConOut, stage);
         st->ConOut->OutputString(st->ConOut, L" failed\r\n");
     }
-    /* Step 2-2 only verifies the file; no kernel execution uses this buffer. */
+    /* Loaded pages survive success; the original file buffer is temporary. */
     if (buffer != NULL) bs->FreePool(buffer);
     if (info != NULL) bs->FreePool(info);
     if (file != NULL) file->Close(file);
