@@ -8,6 +8,7 @@ TARGET := $(BUILD)/kernel.elf
 CXXFLAGS := \
     --target=x86_64-unknown-none-elf \
     -std=c++20 -O0 -g \
+    -I../include \
     -ffreestanding \
     -fno-exceptions -fno-rtti \
     -fno-stack-protector \
@@ -26,7 +27,7 @@ LDFLAGS := \
 
 all: $(TARGET)
 
-$(OBJECT): main.cpp Makefile | $(BUILD)
+$(OBJECT): main.cpp font.h ../include/framebuffer_config.h Makefile | $(BUILD)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(TARGET): $(OBJECT) linker.ld Makefile

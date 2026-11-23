@@ -17,6 +17,7 @@ CFLAGS := \
     --target=x86_64-pc-windows-msvc \
     -I/usr/include/efi \
     -I/usr/include/efi/x86_64 \
+    -I../include \
     -ffreestanding \
     -fshort-wchar \
     -fno-stack-protector \
@@ -31,7 +32,7 @@ LDFLAGS := \
 all: $(TARGET)
 
 # 1. C -> COFF object
-$(OBJECT): main.c elf.h
+$(OBJECT): main.c elf.h ../include/framebuffer_config.h Makefile
 	mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 

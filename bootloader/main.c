@@ -1,3 +1,5 @@
+/* Declare the SysV entry type before GNU-EFI masks __attribute__ on MSVC. */
+#include "framebuffer_config.h"
 #include <efi.h>
 #include "elf.h"
 
@@ -282,7 +284,97 @@ cleanup:
     return status;
 }
 
-typedef VOID (__attribute__((sysv_abi)) *KERNEL_ENTRY)(VOID);
+/* OVMF identity maps the RAM holding its page tables. Inspect the existing
+ * mappings without touching framebuffer MMIO or changing CR3. */
+static BOOLEAN framebuffer_is_mapped(UINT64 base, UINT64 size)
+{
+    UINT64 cr3, cr4;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+    const UINT64 address_mask = 0x000FFFFFFFFFF000ULL;
+    const UINT64 end = base + size;
+    const int top_shift = (cr4 & (1ULL << 12)) ? 48 : 39;
+
+    for (UINT64 address = base; address < end;) {
+        UINT64 table_address = cr3 & address_mask;
+        for (int shift = top_shift; shift >= 12; shift -= 9) {
+            const volatile UINT64 *table = (const volatile UINT64 *)(UINTN)table_address;
+            UINT64 entry = table[(address >> shift) & 0x1FF];
+            if ((entry & 3) != 3) return FALSE; /* Present and writable. */
+
+            if (shift == 12 || ((shift == 30 || shift == 21) && (entry & 0x80))) {
+                UINT64 page_mask = (1ULL << shift) - 1;
+                UINT64 page_base = address & ~page_mask;
+                if ((entry & address_mask & ~page_mask) != page_base)
+                    return FALSE;
+                address = page_base + page_mask + 1;
+                break;
+            }
+            table_address = entry & address_mask;
+        }
+    }
+    return TRUE;
+}
+
+static EFI_STATUS get_framebuffer(EFI_SYSTEM_TABLE *st, FramebufferConfig *config)
+{
+    EFI_GUID guid = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
+    EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = NULL;
+    EFI_STATUS status = st->BootServices->LocateProtocol(&guid, NULL, (VOID **)&gop);
+    if (EFI_ERROR(status)) {
+        st->ConOut->OutputString(st->ConOut, L"LocateProtocol(GOP) failed\r\n");
+        return status;
+    }
+
+    if (!gop || !gop->Mode || !gop->Mode->Info ||
+        gop->Mode->SizeOfInfo < sizeof(*gop->Mode->Info)) {
+        st->ConOut->OutputString(st->ConOut, L"GOP mode information unavailable\r\n");
+        return EFI_DEVICE_ERROR;
+    }
+
+    const EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE *mode = gop->Mode;
+    const EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *info = mode->Info;
+    if (info->PixelFormat == PixelRedGreenBlueReserved8BitPerColor)
+        config->pixel_format = FRAMEBUFFER_RGB;
+    else if (info->PixelFormat == PixelBlueGreenRedReserved8BitPerColor)
+        config->pixel_format = FRAMEBUFFER_BGR;
+    else {
+        st->ConOut->OutputString(st->ConOut, L"Unsupported GOP pixel format= ");
+        print_hex(st, info->PixelFormat);
+        st->ConOut->OutputString(st->ConOut, L"\r\n");
+        return EFI_UNSUPPORTED;
+    }
+
+    const UINT64 base = mode->FrameBufferBase;
+    const UINT64 size = mode->FrameBufferSize;
+    const UINT64 width = info->HorizontalResolution;
+    const UINT64 height = info->VerticalResolution;
+    const UINT64 stride = info->PixelsPerScanLine;
+    const UINT64 lower_half_end = 1ULL << 47;
+    if (!base || (base & 3) || base >= lower_half_end || !size ||
+        size > lower_half_end - base || !width || !height || stride < width ||
+        (height - 1) * stride + width > size / FRAMEBUFFER_BYTES_PER_PIXEL) {
+        st->ConOut->OutputString(st->ConOut, L"Invalid GOP framebuffer range\r\n");
+        return EFI_DEVICE_ERROR;
+    }
+    /* The visible span includes row padding up to the last visible pixel. */
+    const UINT64 visible_size = ((height - 1) * stride + width) *
+                                FRAMEBUFFER_BYTES_PER_PIXEL;
+    if (!framebuffer_is_mapped(base, visible_size)) {
+        st->ConOut->OutputString(st->ConOut, L"GOP framebuffer lacks writable identity mapping\r\n");
+        return EFI_UNSUPPORTED;
+    }
+
+    config->frame_buffer_base = base;
+    config->frame_buffer_size = size;
+    config->horizontal_resolution = info->HorizontalResolution;
+    config->vertical_resolution = info->VerticalResolution;
+    config->pixels_per_scan_line = info->PixelsPerScanLine;
+    return EFI_SUCCESS;
+}
+
+/* The loader image stays resident throughout this kernel's execution. */
+static FramebufferConfig framebuffer_config;
 
 static _Noreturn void halt_cpu(void)
 {
@@ -327,7 +419,7 @@ static EFI_STATUS boot_kernel(EFI_HANDLE image, EFI_SYSTEM_TABLE *st,
         if (status == EFI_SUCCESS) {
             /* Keep the current stack and enter the ELF function with SysV ABI. */
             __asm__ volatile("cli; cld" ::: "memory", "cc");
-            ((KERNEL_ENTRY)(UINTN)entry)();
+            ((KernelEntry)(UINTN)entry)(&framebuffer_config);
             halt_cpu();
         }
         if (status != EFI_INVALID_PARAMETER) break;
@@ -350,9 +442,13 @@ EFI_STATUS EFIAPI efi_main(
         L"Hello World from My OS!\r\n"
     );
 
+    EFI_STATUS status = get_framebuffer(SystemTable, &framebuffer_config);
     UINT64 entry;
-    EFI_STATUS status = load_kernel(ImageHandle, SystemTable, &entry);
+    if (!EFI_ERROR(status)) status = load_kernel(ImageHandle, SystemTable, &entry);
     if (EFI_ERROR(status)) {
+        con->OutputString(con, L"Boot preparation failed status=");
+        print_hex(SystemTable, status);
+        con->OutputString(con, L"\r\n");
         SystemTable->BootServices->Stall(5000000);
         return status;
     }
